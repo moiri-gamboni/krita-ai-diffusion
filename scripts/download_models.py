@@ -49,20 +49,53 @@ async def download(
     destination: Path,
     verbose=False,
     dry_run=False,
+    no_head_request=False,
 ):
+    def is_size_equal(content_length, target_file):
+        local_file_size = target_file.stat().st_size
+        if int(content_length) == local_file_size:
+            print(f"{model.name}: Found - Local file size matches server's - skipping")
+            return True
+        elif verbose:
+            print(f"{model.name}: Found - Local file size differs from server's - downloading")
+        return False
+
     for filepath, url in model.files.items():
         target_file = destination / filepath
+        compared_size = False
         if verbose:
             print(f"Looking for {target_file}")
-        if target_file.exists():
-            print(f"{model.name}: found - skipping")
-            continue
-        if verbose:
+        if target_file.exists() and not no_head_request:
+            # More aggressive timeout
+            timeout = aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=10)
+            async with aiohttp.ClientSession(timeout=timeout) as head_client:
+                try:
+                    async with head_client.head(url, allow_redirects=True) as resp:
+                        resp.raise_for_status()
+                except (aiohttp.ClientResponseError, aiohttp.ServerTimeoutError) as e:
+                    if verbose:
+                        print(f"{model.name}: HEAD request failed, falling back to GET request")
+                else:
+                    content_length = resp.headers.get("Content-Length")
+                    if content_length is not None:
+                        compared_size = True
+                        if is_size_equal(content_length, target_file):
+                            continue
+
+        async with client.get(url) as resp:
+            resp.raise_for_status()
+            # HEAD request did not complete or did not have Content-Length 
+            if target_file.exists() and not compared_size:
+                content_length = resp.headers.get("Content-Length")
+                if verbose and content_length is None:
+                    print(
+                        f"{model.name}: Found - Could not retrieve Content-Length from server - downloading"
+                    )
+                elif is_size_equal(content_length, target_file):
+                    continue
             print(f"Downloading {url}")
-        if not dry_run:
-            target_file.parent.mkdir(exist_ok=True, parents=True)
-            async with client.get(url) as resp:
-                resp.raise_for_status()
+            if not dry_run:
+                target_file.parent.mkdir(exist_ok=True, parents=True)
                 with open(target_file, "wb") as fd:
                     with _progress(model.name, resp.content_length) as pbar:
                         async for chunk, is_end in resp.content.iter_chunks():
@@ -81,6 +114,7 @@ async def main(
     no_controlnet=False,
     prefetch=False,
     minimal=False,
+    no_head_request=False,
 ):
     print(f"Generative AI for Krita - Model download - v{ai_diffusion.__version__}")
     verbose = verbose or dry_run
@@ -100,7 +134,7 @@ async def main(
                 continue
             if verbose:
                 print(f"\n{model.name}")
-            await download(client, model, destination, verbose, dry_run)
+            await download(client, model, destination, verbose, dry_run, no_head_request)
 
 
 if __name__ == "__main__":
@@ -132,6 +166,9 @@ if __name__ == "__main__":
     parser.add_argument("--no-controlnet", action="store_true", help="skip ControlNet models")
     parser.add_argument("--prefetch", action="store_true", help="fetch models which would be automatically downloaded on first use") # fmt: skip
     parser.add_argument("-m", "--minimal", action="store_true", help="minimum viable set of models")
+    parser.add_argument(
+        "--no-head-request", action="store_true", help="skip head request to check download size"
+    )
     args = parser.parse_args()
     args.no_sdxl = args.no_sdxl or args.minimal
     asyncio.run(
